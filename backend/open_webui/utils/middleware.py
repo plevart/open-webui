@@ -1002,6 +1002,13 @@ async def apply_source_context_to_messages(
             append=False,
         )
 
+DATA_URI_RE = re.compile(r'^data:([^;]+);base64,(.*)$')
+
+def _parse_data_uri(uri: str):
+   m = DATA_URI_RE.match(uri)
+   if not m:
+       return None
+   return m.group(1), m.group(2)   # mime_type, b64_data
 
 async def process_tool_result(
     request,
@@ -1124,13 +1131,38 @@ async def process_tool_result(
     # Detect base64 image data URIs from tool results (e.g. binary image
     # responses from execute_tool_server).  Move the data URI to
     # tool_result_files and replace tool_result with a text summary.
-    if isinstance(tool_result, str) and tool_result.startswith('data:image/'):
-        tool_result_files.append({'type': 'image', 'url': tool_result})
-        tool_result = f'{tool_function_name}: Image file read successfully.'
+    if isinstance(tool_result, str) and (parsed := _parse_data_uri(tool_result)):
+        (mime_type, data) = parsed
+        # Upload for UI display (only supports certain data: URI forms, returns None if unsupported)
+        file_url = await get_file_url_from_base64(
+            request,
+            tool_result,
+            {
+                'chat_id': metadata.get('chat_id', None),
+                'message_id': metadata.get('message_id', None),
+                'session_id': metadata.get('session_id', None),
+                'mime_type': mime_type,
+                'b64_len': len(data),
+            },
+            user,
+        )
+        if mime_type.startswith('image/'):
+            data_type = 'image'
+        elif mime_type.startswith('audio/'):
+            data_type = 'audio'
+        else:
+            data_type = 'binary'
+        # UI display file
+        if file_url:
+          tool_result_files.append({'type': data_type, 'url': file_url})
+        # Keep data URI for model consumption via input_image
+        tool_result_files.append({'type': data_type, 'url': tool_result})
+        tool_result = f'[{data_type} data]'
+
 
     if isinstance(tool_result, list):
+        tool_response = []
         if tool_type == 'mcp':  # MCP
-            tool_response = []
             for item in tool_result:
                 if isinstance(item, dict):
                     if item.get('type') == 'text':
@@ -1142,24 +1174,30 @@ async def process_tool_result(
                                 pass
                         tool_response.append(text)
                     elif item.get('type') in ['image', 'audio']:
+                        mime_type = item.get('mimeType') or 'application/octet-stream'
+                        data = item.get('data', item.get('blob', ''))
+                        data_url = f'data:{mime_type};base64,{data}'
+                        data_type = item.get('type')
+                        # Upload for UI display so the chat shows a proper file URL
                         file_url = await get_file_url_from_base64(
                             request,
-                            f'data:{item.get("mimeType")};base64,{item.get("data", item.get("blob", ""))}',
+                            data_url,
                             {
                                 'chat_id': metadata.get('chat_id', None),
                                 'message_id': metadata.get('message_id', None),
                                 'session_id': metadata.get('session_id', None),
-                                'result': item,
+                                'mime_type': mime_type,
+                                'b64_len': len(data),
                             },
                             user,
                         )
-
-                        tool_result_files.append(
-                            {
-                                'type': item.get('type', 'data'),
-                                'url': file_url,
-                            }
-                        )
+                        # UI display file
+                        if file_url:
+                            tool_result_files.append({'type': data_type, 'url': file_url})
+                        # Keep data URI for model consumption via input_image
+                        tool_result_files.append({'type': data_type, 'url': data_url})
+                        # Add a textual summary so the tool result is not empty in the UI
+                        tool_response.append(f'[{data_type} data]')
                     elif item.get('type') == 'resource':
                         resource = item.get('resource', {})
                         text = resource.get('text', '')
@@ -1170,33 +1208,69 @@ async def process_tool_result(
                                 pass
                             tool_response.append(text)
                         elif resource.get('blob'):
-                            resource_mime_type = resource.get('mimeType') or 'application/octet-stream'
-                            resource_blob = resource.get('blob', '')
-                            if resource_mime_type.startswith('image/'):
-                                tool_result_files.append(
-                                    {
-                                        'type': 'image',
-                                        'url': f'data:{resource_mime_type};base64,{resource_blob}',
-                                    }
-                                )
+                            mime_type = resource.get('mimeType') or 'application/octet-stream'
+                            data = resource.get('blob', '')
+                            data_url = f'data:{mime_type};base64,{data}'
+                            if mime_type.startswith('image/'):
+                                data_type = 'image'
+                            elif mime_type.startswith('audio/'):
+                                data_type = 'audio'
                             else:
-                                resource_uri = resource.get('uri', 'resource')
-                                tool_response.append(
-                                    f'[Resource: {resource_uri}] (binary data, mimeType: {resource_mime_type})'
-                                )
+                                data_type = 'binary'
+                            # Upload for UI display
+                            file_url = await get_file_url_from_base64(
+                                request,
+                                data_url,
+                                {
+                                    'chat_id': metadata.get('chat_id', None),
+                                    'message_id': metadata.get('message_id', None),
+                                    'session_id': metadata.get('session_id', None),
+                                    'mime_type': mime_type,
+                                    'b64_len': len(data),
+                                },
+                                user,
+                            )
+                            # UI display file
+                            if file_url:
+                                tool_result_files.append({'type': data_type, 'url': file_url})
+                            # Keep data URI for model
+                            tool_result_files.append({'type': data_type, 'url': data_url})
+                            # Generic textual summary
+                            tool_response.append(f'[{data_type} data]')
                         elif resource.get('uri'):
                             tool_response.append(resource.get('uri'))
-            tool_result = tool_response[0] if len(tool_response) == 1 else tool_response
-        else:  # OpenAPI
+        else:  # tool_type != 'mcp' (OpenAPI for example)
             for item in tool_result:
-                if isinstance(item, str) and item.startswith('data:'):
-                    tool_result_files.append(
+                if isinstance(item, str) and (parsed := _parse_data_uri(item)):
+                    (mime_type, data) = parsed
+                    # Upload for UI display
+                    file_url = await get_file_url_from_base64(
+                        request,
+                        item,
                         {
-                            'type': 'data',
-                            'content': item,
-                        }
+                            'chat_id': metadata.get('chat_id', None),
+                            'message_id': metadata.get('message_id', None),
+                            'session_id': metadata.get('session_id', None),
+                            'mime_type': mime_type,
+                            'b64_len': len(data),
+                        },
+                        user,
                     )
-                    tool_result.remove(item)
+                    if mime_type.startswith('image/'):
+                        data_type = 'image'
+                    elif mime_type.startswith('audio/'):
+                        data_type = 'audio'
+                    else:
+                        data_type = 'binary'
+                    # UI display file
+                    if file_url:
+                      tool_result_files.append({'type': data_type, 'url': file_url})
+                    # Keep data URI for model consumption via input_image
+                    tool_result_files.append({'type': data_type, 'url': item})
+                    # Generic textual summary
+                    tool_response.append(f'[{data_type} data]')
+
+        tool_result = tool_response[0] if len(tool_response) == 1 else tool_response
 
     if isinstance(tool_result, list):
         tool_result = {'results': tool_result}
