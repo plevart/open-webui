@@ -1007,23 +1007,63 @@ async def apply_source_context_to_messages(
         )
 
 
-BASE64_IMAGE_DATA_URI_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}', re.IGNORECASE)
+BASE64_MEDIA_DATA_URI_RE = re.compile(
+    r'data:(image|audio)/([a-z0-9.+-]+);base64,([a-z0-9+/]+={0,2})',
+    re.IGNORECASE,
+)
+
+def extract_base64_media(
+        tool_result: Any,
+        files: list
+) -> Any:
+    """Move base64 media data URIs out of a tool result so they do not reach the model as text."""
+    if isinstance(tool_result, str):
+        if match := BASE64_MEDIA_DATA_URI_RE.fullmatch(tool_result):
+            # Append data: URI for model consumption via input_image (and other means)
+            files.append({'type': match.group(1), 'url': tool_result})
+            # replace it with short informational string: "[<type> data]"
+            return f'[{match.group(1)} data]'
+
+        return tool_result
+    if isinstance(tool_result, dict):
+        return {key: extract_base64_media(item, files) for key, item in tool_result.items()}
+    if isinstance(tool_result, list):
+        return [extract_base64_media(item, files) for item in tool_result]
+    if isinstance(tool_result, tuple):
+        return tuple(extract_base64_media(item, files) for item in tool_result)
+    return tool_result
 
 
-def extract_base64_images(value: Any, files: list) -> Any:
-    """Move base64 image data URIs out of a tool result so they do not reach the model as text."""
-    if isinstance(value, str):
-        if BASE64_IMAGE_DATA_URI_RE.fullmatch(value):
-            files.append({'type': 'image', 'url': value})
-            return '[image]'
-        return value
-    if isinstance(value, dict):
-        return {key: extract_base64_images(item, files) for key, item in value.items()}
-    if isinstance(value, list):
-        return [extract_base64_images(item, files) for item in value]
-    if isinstance(value, tuple):
-        return tuple(extract_base64_images(item, files) for item in value)
-    return value
+def audio_data_url_to_openai(data_url: str) -> dict:
+    """Convert audio data: URL to OpenAI API structure"""
+    match = BASE64_MEDIA_DATA_URI_RE.fullmatch(data_url)
+    if not match or match.group(1) != "audio":
+        raise ValueError("Expected a base64 audio data URI")
+
+    audio_type = match.group(2)
+    base64_data = match.group(3)
+
+    audio_type_to_format = {
+        "wav": "wav",
+        "x-wav": "wav",
+        "mpeg": "mp3",
+        "mp3": "mp3",
+    }
+
+    try:
+        audio_format = audio_type_to_format[audio_type.lower()]
+    except KeyError:
+        raise ValueError(
+            f"Unsupported audio MIME type for input_audio: audio/{audio_type}"
+        )
+
+    return {
+        "type": "input_audio",
+        "input_audio": {
+            "data": base64_data,
+            "format": audio_format,
+        },
+    }
 
 
 async def store_tool_result_image(request, image_url, metadata, user):
@@ -1047,6 +1087,36 @@ async def store_tool_result_image(request, image_url, metadata, user):
     except Exception:
         log.warning('Could not store tool image; retaining inline image')
         return image_url
+
+
+async def tool_result_files_to_output_parts_and_display_files(
+    request,
+    metadata,
+    user,
+    result_files: list
+):
+    """Split result files entries into OpenAI API output parts and display files"""
+    output_parts = []
+    display_files = []
+    for file_item in result_files:
+        if file_item.get('type') == 'image':
+            image_url = file_item.get('url', '')
+            # try to convert inline data: URL to remote URL by storing image to files
+            if image_url.startswith('data:'):
+                image_url = await store_tool_result_image(request, image_url, metadata, user)
+            # OpenAI accepts either inline data: URLs or remote URLs, but we prefer remote for faster caching on the server side
+            output_parts.append({'type': 'input_image', 'image_url': image_url})
+            # For display, we only want remote URLs
+            if not image_url.startswith('data:'):
+                display_files.append({'type': 'image', 'url': image_url})
+        if file_item.get('type') == 'audio':
+            audio_url = file_item.get('url', '')
+            # OpenAI accepts special in-line substructure for audio parts
+            if audio_url.startswith('data:'):
+                output_parts.append(audio_data_url_to_openai(audio_url))
+            # We don't support (dis)playing the audio in UI (yet?)
+
+    return output_parts, display_files
 
 
 async def process_tool_result(
@@ -1165,87 +1235,49 @@ async def process_tool_result(
                             'message': f'{tool_function_name}: Embedded UI result is active and visible to the user.',
                         }
 
-    tool_result_files = []
-
-    # Detect base64 image data URIs from tool results (e.g. binary image
-    # responses from execute_tool_server).  Move the data URI to
-    # tool_result_files and replace tool_result with a text summary.
-    if isinstance(tool_result, str) and tool_result.startswith('data:image/'):
-        tool_result_files.append({'type': 'image', 'url': tool_result})
-        tool_result = f'{tool_function_name}: Image file read successfully.'
-
-    if isinstance(tool_result, list):
-        if tool_type == 'mcp':  # MCP
-            tool_response = []
-            for item in tool_result:
-                if isinstance(item, dict):
-                    if item.get('type') == 'text':
-                        text = item.get('text', '')
-                        if isinstance(text, str):
-                            try:
-                                text = JSONCodec.loads(text)
-                            except JSONCodec.JSONDecodeError:
-                                pass
+    if isinstance(tool_result, list) and tool_type == 'mcp':
+        # collect all MCP tool_result items into tool_response extracting:
+        # - if type=image|audio -> data: URI
+        # - if type=text -> parsed JSON structure if it represents JSON or the text itself if not
+        # - if type=resource -> parsed JSON structure / text itself if it contains text attribute
+        # - if tpye=resource -> data: URI if it contains blob attribute
+        # - if uri attribute is present -> uri
+        tool_response = []
+        for item in tool_result:
+            if isinstance(item, dict):
+                if item.get('type') == 'text':
+                    text = item.get('text', '')
+                    if isinstance(text, str):
+                        try:
+                            text = JSONCodec.loads(text)
+                        except JSONCodec.JSONDecodeError:
+                            pass
+                    tool_response.append(text)
+                elif item.get('type') in ['image', 'audio']:
+                    data_url = f'data:{item.get("mimeType") or "application/octet-stream"};base64,{item.get("data", item.get("blob", ""))}'
+                    tool_response.append(data_url)
+                elif item.get('type') == 'resource':
+                    resource = item.get('resource', {})
+                    text = resource.get('text', '')
+                    if isinstance(text, str) and text:
+                        try:
+                            text = JSONCodec.loads(text)
+                        except JSONCodec.JSONDecodeError:
+                            pass
                         tool_response.append(text)
-                    elif item.get('type') in ['image', 'audio']:
-                        file_url = await get_file_url_from_base64(
-                            request,
-                            f'data:{item.get("mimeType")};base64,{item.get("data", item.get("blob", ""))}',
-                            {
-                                'chat_id': metadata.get('chat_id', None),
-                                'message_id': metadata.get('message_id', None),
-                                'session_id': metadata.get('session_id', None),
-                                'result': item,
-                            },
-                            user,
-                        )
+                    elif resource.get('blob'):
+                        data_url = f'data:{resource.get("mimeType") or "application/octet-stream"};base64,{resource.get("blob", "")}'
+                        tool_response.append(data_url)
+                elif resource.get('uri'):
+                        tool_response.append(resource.get('uri'))
+        # replace tool_result with collected tool_response (single or list)
+        tool_result = tool_response[0] if len(tool_response) == 1 else tool_response
+        # OpenAPI: media data: URIs are left to extract_base64_media below, which attaches them so the model can see them.
 
-                        tool_result_files.append(
-                            {
-                                'type': item.get('type', 'data'),
-                                'url': file_url,
-                            }
-                        )
-                    elif item.get('type') == 'resource':
-                        resource = item.get('resource', {})
-                        text = resource.get('text', '')
-                        if isinstance(text, str) and text:
-                            try:
-                                text = JSONCodec.loads(text)
-                            except JSONCodec.JSONDecodeError:
-                                pass
-                            tool_response.append(text)
-                        elif resource.get('blob'):
-                            resource_mime_type = resource.get('mimeType') or 'application/octet-stream'
-                            resource_blob = resource.get('blob', '')
-                            if resource_mime_type.startswith('image/'):
-                                tool_result_files.append(
-                                    {
-                                        'type': 'image',
-                                        'url': f'data:{resource_mime_type};base64,{resource_blob}',
-                                    }
-                                )
-                            else:
-                                resource_uri = resource.get('uri', 'resource')
-                                tool_response.append(
-                                    f'[Resource: {resource_uri}] (binary data, mimeType: {resource_mime_type})'
-                                )
-                        elif resource.get('uri'):
-                            tool_response.append(resource.get('uri'))
-            tool_result = tool_response[0] if len(tool_response) == 1 else tool_response
-        else:  # OpenAPI
-            # Images are left to extract_base64_images below, which attaches them so the model can see them.
-            for item in list(tool_result):
-                if isinstance(item, str) and item.startswith('data:') and not BASE64_IMAGE_DATA_URI_RE.fullmatch(item):
-                    tool_result_files.append(
-                        {
-                            'type': 'data',
-                            'content': item,
-                        }
-                    )
-                    tool_result.remove(item)
-
-    tool_result = extract_base64_images(tool_result, tool_result_files)
+    # extract all media data: URIs into appropriate entries of tool_result_files and replace them in
+    # tool_result with texts indicating what type of data was extracted
+    tool_result_files = []
+    tool_result = extract_base64_media(tool_result, tool_result_files)
 
     if isinstance(tool_result, list):
         tool_result = {'results': tool_result}
@@ -3480,13 +3512,16 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
         item['arguments'] = tool_call.get('function', {}).get('arguments', '{}')
         output_parts = [{'type': 'input_text', 'text': result.get('content', '')}]
         item['status'] = 'failed' if _is_tool_result_error(result.get('content', '')) else 'completed'
-        display_files = []
-        for file_item in result.get('files', []):
-            if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
-                image_url = await store_tool_result_image(request, file_item['url'], metadata, user)
-                output_parts.append({'type': 'input_image', 'image_url': image_url})
-            else:
-                display_files.append(file_item)
+
+        # Split tool result files into file_output_parts (for LLM via input_image or input_audio)
+        # and files for frontend display.
+        (file_output_parts, display_files) = await tool_result_files_to_output_parts_and_display_files(
+            request,
+            metadata,
+            user,
+            result.get('files', [])
+        )
+        output_parts += file_output_parts
 
         output.append(
             {
@@ -6127,17 +6162,15 @@ async def streaming_chat_response_handler(response, ctx):
                         )
                         result_status_by_call_id[result.get('tool_call_id', '')] = local_output_status
 
-                        # Separate image data URIs (for LLM via input_image) from
-                        # other files (for frontend display via files attribute).
-                        display_files = []
-                        for file_item in result.get('files', []):
-                            if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
-                                # LLM-only: add as input_image part, not frontend display output.
-                                image_url = await store_tool_result_image(request, file_item['url'], metadata, user)
-                                output_parts.append({'type': 'input_image', 'image_url': image_url})
-                            else:
-                                # Frontend display (MCP images, audio, etc.)
-                                display_files.append(file_item)
+                        # Split tool result files into file_output_parts (for LLM via input_image or input_audio)
+                        # and files for frontend display.
+                        (file_output_parts, display_files) = await tool_result_files_to_output_parts_and_display_files(
+                            request,
+                            metadata,
+                            user,
+                            result.get('files', [])
+                        )
+                        output_parts += file_output_parts
 
                         output.append(
                             {
