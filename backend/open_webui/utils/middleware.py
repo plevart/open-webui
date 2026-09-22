@@ -1240,8 +1240,8 @@ async def process_tool_result(
         # - if type=image|audio -> data: URI
         # - if type=text -> parsed JSON structure if it represents JSON or the text itself if not
         # - if type=resource -> parsed JSON structure / text itself if it contains text attribute
-        # - if tpye=resource -> data: URI if it contains blob attribute
-        # - if uri attribute is present -> uri
+        # - if type=resource -> data: URI if it contains blob attribute
+        # - if type=resource -> uri if it contains uri attribute
         tool_response = []
         for item in tool_result:
             if isinstance(item, dict):
@@ -1268,7 +1268,7 @@ async def process_tool_result(
                     elif resource.get('blob'):
                         data_url = f'data:{resource.get("mimeType") or "application/octet-stream"};base64,{resource.get("blob", "")}'
                         tool_response.append(data_url)
-                elif resource.get('uri'):
+                    elif resource.get('uri'):
                         tool_response.append(resource.get('uri'))
         # replace tool_result with collected tool_response (single or list)
         tool_result = tool_response[0] if len(tool_response) == 1 else tool_response
