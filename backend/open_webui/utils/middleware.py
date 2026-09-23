@@ -1015,7 +1015,7 @@ def extract_base64_images(value: Any, files: list) -> Any:
     if isinstance(value, str):
         if BASE64_IMAGE_DATA_URI_RE.fullmatch(value):
             files.append({'type': 'image', 'url': value})
-            return '[image]'
+            return '[image data]'
         return value
     if isinstance(value, dict):
         return {key: extract_base64_images(item, files) for key, item in value.items()}
@@ -1047,6 +1047,27 @@ async def store_tool_result_image(request, image_url, metadata, user):
     except Exception:
         log.warning('Could not store tool image; retaining inline image')
         return image_url
+
+
+async def split_tool_result_files_to_output_parts_and_display_files(
+    request,
+    result_files: list,
+    metadata,
+    user
+):
+    output_parts = []
+    display_files = []
+    for file_item in result_files:
+        if (type := file_item.get('type')) and (url := file_item.get('url')):
+            if type == 'image':
+                # prefer remote file URLs to inline data: URIs for images in saved chats
+                if url.startswith('data:'):
+                    url = await store_tool_result_image(request, url, metadata, user)
+                # we currently support only image parts in answers to LLM
+                output_parts.append({'type': 'input_image', 'image_url': url})
+            # we display anything
+            display_files.append({'type': type, 'url': url})
+    return output_parts, display_files
 
 
 async def process_tool_result(
@@ -1172,7 +1193,7 @@ async def process_tool_result(
     # tool_result_files and replace tool_result with a text summary.
     if isinstance(tool_result, str) and tool_result.startswith('data:image/'):
         tool_result_files.append({'type': 'image', 'url': tool_result})
-        tool_result = f'{tool_function_name}: Image file read successfully.'
+        tool_result = '[image data]'
 
     if isinstance(tool_result, list):
         if tool_type == 'mcp':  # MCP
@@ -1188,24 +1209,13 @@ async def process_tool_result(
                                 pass
                         tool_response.append(text)
                     elif item.get('type') in ['image', 'audio']:
-                        file_url = await get_file_url_from_base64(
-                            request,
-                            f'data:{item.get("mimeType")};base64,{item.get("data", item.get("blob", ""))}',
-                            {
-                                'chat_id': metadata.get('chat_id', None),
-                                'message_id': metadata.get('message_id', None),
-                                'session_id': metadata.get('session_id', None),
-                                'result': item,
-                            },
-                            user,
-                        )
-
                         tool_result_files.append(
                             {
-                                'type': item.get('type', 'data'),
-                                'url': file_url,
+                                'type': item['type'],
+                                'url': f'data:{item.get("mimeType")};base64,{item.get("data", item.get("blob", ""))}',
                             }
                         )
+                        tool_response.append(f'[{item["type"]} data]')
                     elif item.get('type') == 'resource':
                         resource = item.get('resource', {})
                         text = resource.get('text', '')
@@ -1225,7 +1235,9 @@ async def process_tool_result(
                                         'url': f'data:{resource_mime_type};base64,{resource_blob}',
                                     }
                                 )
+                                tool_response.append("[image data]")
                             else:
+                                # what does that mean actually? What if uri is big inline data:... ?
                                 resource_uri = resource.get('uri', 'resource')
                                 tool_response.append(
                                     f'[Resource: {resource_uri}] (binary data, mimeType: {resource_mime_type})'
@@ -3480,15 +3492,13 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
         item['arguments'] = tool_call.get('function', {}).get('arguments', '{}')
         output_parts = [{'type': 'input_text', 'text': result.get('content', '')}]
         item['status'] = 'failed' if _is_tool_result_error(result.get('content', '')) else 'completed'
-        display_files = []
-        for file_item in result.get('files', []):
-            if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
-                image_url = await store_tool_result_image(request, file_item['url'], metadata, user)
-                output_parts.append({'type': 'input_image', 'image_url': image_url})
-            else:
-                display_files.append(file_item)
-                if file_item.get('type') == 'image' and file_item.get('url'):
-                    output_parts.append({'type': 'input_image', 'image_url': file_item['url']})
+        file_output_parts, display_files = await split_tool_result_files_to_output_parts_and_display_files(
+            request,
+            result.get('files', []),
+            metadata,
+            user
+        )
+        output_parts += file_output_parts
 
         output.append(
             {
@@ -6129,17 +6139,13 @@ async def streaming_chat_response_handler(response, ctx):
                         )
                         result_status_by_call_id[result.get('tool_call_id', '')] = local_output_status
 
-                        # Data-URI images: LLM only. File-URL images: LLM and frontend. Other files: frontend.
-                        display_files = []
-                        for file_item in result.get('files', []):
-                            if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
-                                # LLM-only: add as input_image part, not frontend display output.
-                                image_url = await store_tool_result_image(request, file_item['url'], metadata, user)
-                                output_parts.append({'type': 'input_image', 'image_url': image_url})
-                            else:
-                                display_files.append(file_item)
-                                if file_item.get('type') == 'image' and file_item.get('url'):
-                                    output_parts.append({'type': 'input_image', 'image_url': file_item['url']})
+                        file_output_parts, display_files = await split_tool_result_files_to_output_parts_and_display_files(
+                            request,
+                            result.get('files', []),
+                            metadata,
+                            user
+                        )
+                        output_parts += file_output_parts
 
                         output.append(
                             {
